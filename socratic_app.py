@@ -8,7 +8,7 @@ import streamlit as st
 import pickle
 import os
 import anthropic
-import chromadb
+import numpy as np
 from sentence_transformers import SentenceTransformer
 
 # ── Page config ───────────────────────────────────────────────
@@ -188,29 +188,39 @@ def load_embed_model():
     return SentenceTransformer('all-MiniLM-L6-v2')
 
 @st.cache_resource
-def load_chroma():
-    """Load exported chunks and rebuild ChromaDB in memory."""
+def load_vector_store():
+    """Load exported chunks into a simple numpy vector store."""
     pkl_path = os.path.join(BASE_DIR, "chroma_export.pkl")
     with open(pkl_path, 'rb') as f:
         data = pickle.load(f)
+    # Convert embeddings to numpy array for fast similarity search
+    embeddings = np.array(data['embeddings'], dtype=np.float32)
+    return {
+        'embeddings': embeddings,
+        'documents': data['documents'],
+        'metadatas': data['metadatas'],
+    }, len(data['documents'])
 
-    client = chromadb.Client()  # in-memory only
-    try:
-        client.delete_collection("socratic_tutor")
-    except:
-        pass
-
-    col = client.create_collection("socratic_tutor")
-    col.add(
-        documents=data['documents'],
-        embeddings=data['embeddings'],
-        metadatas=data['metadatas'],
-        ids=data['ids']
-    )
-    return col, len(data['documents'])
+def cosine_similarity_search(query_embedding, store, n_results=3):
+    """Pure numpy cosine similarity — no ChromaDB needed."""
+    q = np.array(query_embedding, dtype=np.float32)
+    q = q / (np.linalg.norm(q) + 1e-10)
+    embs = store['embeddings']
+    norms = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-10
+    normed = embs / norms
+    scores = normed @ q
+    top_idx = np.argsort(scores)[::-1][:n_results]
+    return [
+        {
+            'document': store['documents'][i],
+            'metadata': store['metadatas'][i],
+            'score': float(scores[i])
+        }
+        for i in top_idx
+    ]
 
 embed_model = load_embed_model()
-collection, chunk_count = load_chroma()
+vector_store, chunk_count = load_vector_store()
 
 # ── Header ────────────────────────────────────────────────────
 st.markdown("""
@@ -307,21 +317,20 @@ Respond with ONE Socratic question only. Be intellectually rigorous. Do not be g
 def ask_tutor(student_input):
     """Full RAG pipeline: retrieve → prompt → generate."""
     q_emb = embed_model.encode(student_input).tolist()
-    results = collection.query(query_embeddings=[q_emb], n_results=3)
+    results = cosine_similarity_search(q_emb, vector_store, n_results=3)
 
     passages = []
     passage_meta = []
-    for i, (doc, meta, dist) in enumerate(zip(
-        results['documents'][0],
-        results['metadatas'][0],
-        results['distances'][0]
-    )):
+    for i, r in enumerate(results):
+        doc  = r['document']
+        meta = r['metadata']
+        score = r['score']
         passages.append(
-            f"[Passage {i+1} — {meta['source']} | relevance: {1-dist:.2f}]\n{doc[:400]}"
+            f"[Passage {i+1} — {meta['source']} | relevance: {score:.2f}]\n{doc[:400]}"
         )
         passage_meta.append({
             'source': meta['source'],
-            'relevance': round(1 - dist, 2),
+            'relevance': round(score, 2),
             'text': doc[:300]
         })
 
